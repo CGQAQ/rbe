@@ -966,10 +966,17 @@ write_client_file() { # $1=path, content on stdin
 siso_client_files() { # $1=chromium_src $2=master_addr $3=instance
   local src="$1" addr="$2" instance="$3"
 
+  # Cap in-flight remote steps at ~3x cluster slots. Siso's default Remote
+  # limit is in the thousands; against a small NativeLink cluster that dumps
+  # every ready step into the scheduler queue at once. Actions then sit
+  # QUEUED past siso's per-call deadline -> mass DeadlineExceeded retries and
+  # eventually fallback-on-Aborted local compiles that starve the client CPU.
+  local slots="${WORKER_SLOTS:-16}"
   write_client_file "$src/build/config/siso/.sisoenv" <<EOF
 SISO_REAPI_ADDRESS=$addr
 SISO_REAPI_INSTANCE=$instance
 RBE_service_no_security=true
+SISO_LIMITS=remote=$((slots * 3))
 EOF
 
   write_client_file "$src/build/config/siso/backend_config/backend.star" <<'EOF'
