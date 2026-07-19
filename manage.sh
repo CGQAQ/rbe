@@ -1114,7 +1114,7 @@ cmd_ramdisk() {
 # (~40/min fresh -> ~20/min after ~15M inodes). A recycle restores the fresh
 # rate; caches repopulate from the master CAS in ~2-3 min.
 cmd_refresh_scratch() {
-  load_env
+  require_env
   ./manage.sh stop >/dev/null 2>&1 || true
   if mount | grep -q " /Volumes/NLRam "; then
     local dev
