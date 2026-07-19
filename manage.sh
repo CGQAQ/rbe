@@ -107,11 +107,18 @@ mkdirs() {
 }
 
 # Roles that run on this node, in start order.
+worker_roles() { # one role per shard: metadata load shards across APFS volumes
+  local shards="${WORKER_SHARDS:-1}" i out=""
+  if [ "$shards" -le 1 ]; then echo worker; return; fi
+  for i in $(seq 1 "$shards"); do out="$out worker-$i"; done
+  echo $out
+}
+
 node_roles() {
   case "$ROLE" in
     master) echo "master" ;;
-    worker) echo "worker" ;;
-    both)   echo "master worker" ;;
+    worker) worker_roles ;;
+    both)   echo "master $(worker_roles)" ;;
     *) die "Unknown ROLE '$ROLE' in $ENV_FILE" ;;
   esac
 }
@@ -346,7 +353,8 @@ cmd_config() {
   require_env
   mkdirs
   if has_role master; then generate_master_config; else rm -f "$(config_path_for master)"; fi
-  if has_role worker; then generate_worker_config; else rm -f "$(config_path_for worker)"; fi
+  rm -f "$CONF_DIR"/worker*.json5
+  case "$ROLE" in worker|both) generate_worker_config ;; esac
 }
 
 # ---------------------------------------------------------------------------
@@ -518,7 +526,20 @@ EOF
 }
 
 generate_worker_config() {
-  local out; out="$(config_path_for worker)"
+  local shards="${WORKER_SHARDS:-1}" i
+  if [ "$shards" -le 1 ]; then
+    WORKER_CPU="$WORKER_SLOTS" WORKER_INFLIGHT="${MAX_INFLIGHT:-10}"       generate_worker_config_one "$(config_path_for worker)"
+    return
+  fi
+  local base_name="$WORKER_NAME" base_data="$WORKER_DATA_DIR"
+  for i in $(seq 1 "$shards"); do
+    WORKER_DATA_DIR="/Volumes/NLRam$i/worker"     WORKER_NAME="$base_name-$i"     WORKER_CPU=$((WORKER_SLOTS / shards))     WORKER_INFLIGHT=$(( (${MAX_INFLIGHT:-10} + shards - 1) / shards ))       generate_worker_config_one "$(config_path_for "worker-$i")"
+  done
+  WORKER_DATA_DIR="$base_data"
+}
+
+generate_worker_config_one() {
+  local out="$1"
   case "$WORKER_DATA_DIR" in
     /Volumes/*)
       mount | grep -q " ${WORKER_DATA_DIR%/*} " ||         die "WORKER_DATA_DIR $WORKER_DATA_DIR is not mounted — run './manage.sh ramdisk' first (RAM disks do not survive reboot)"
@@ -611,7 +632,7 @@ generate_worker_config() {
         // release before cleanup), an inflight slot is held until the
         // action's ~14k-file workdir is deleted — backpressure that stops
         // unlink debt from piling up on the APFS volume.
-        max_inflight_tasks: ${MAX_INFLIGHT:-10},
+        max_inflight_tasks: ${WORKER_INFLIGHT:-10},
         $( [ "${DIR_CACHE_ENABLE:-1}" = "1" ] && cat <<DCEOF
         directory_cache: {
           max_entries: ${DIR_CACHE_ENTRIES:-1200},
@@ -628,7 +649,7 @@ DCEOF
         platform_properties: {
           // Capacity: WORKER_SLOTS concurrent actions (each action asks for 1).
           cpu_count: {
-            values: ["$WORKER_SLOTS"],
+            values: ["${WORKER_CPU:-$WORKER_SLOTS}"],
           },
           OSFamily: {
             values: ["Mac"],
@@ -1097,16 +1118,16 @@ resolve_siso_target() {
 # './manage.sh start'.
 cmd_ramdisk() {
   [ -f "$ENV_FILE" ] && . "$ENV_FILE"
-  local size_gb="${RAMDISK_GB:-24}" vol="/Volumes/NLRam"
-  if mount | grep -q " $vol "; then
-    log "RAM disk already mounted at $vol"
-    return 0
-  fi
-  local sectors=$((size_gb * 2097152)) dev
-  dev=$(hdiutil attach -nomount ram://$sectors) || die "hdiutil attach failed"
-  dev=$(printf '%s' "$dev" | tr -d ' 	')
-  diskutil eraseDisk APFS NLRam "$dev" >/dev/null || die "diskutil eraseDisk $dev failed"
-  log "RAM disk mounted at $vol (${size_gb}GB, $dev). Contents vanish on reboot/unmount."
+  local size_gb="${RAMDISK_GB:-8}" shards="${WORKER_SHARDS:-1}" i vol dev sectors
+  for i in $(seq 1 "$shards"); do
+    vol="/Volumes/NLRam$i"; [ "$shards" -le 1 ] && vol="/Volumes/NLRam"
+    if mount | grep -q " $vol "; then log "RAM disk already mounted at $vol"; continue; fi
+    sectors=$((size_gb * 2097152))
+    dev=$(hdiutil attach -nomount ram://$sectors) || die "hdiutil attach failed"
+    dev=$(printf '%s' "$dev" | tr -d ' 	')
+    diskutil eraseDisk APFS "${vol##*/}" "$dev" >/dev/null || die "diskutil eraseDisk $dev failed"
+    log "RAM disk mounted at $vol (${size_gb}GB, $dev). Contents vanish on reboot/unmount."
+  done
 }
 
 # Recycle the RAM-disk scratch: APFS metadata (B-tree) bloat from millions
@@ -1116,12 +1137,11 @@ cmd_ramdisk() {
 cmd_refresh_scratch() {
   require_env
   ./manage.sh stop >/dev/null 2>&1 || true
-  if mount | grep -q " /Volumes/NLRam "; then
-    local dev
-    dev=$(mount | awk '$3=="/Volumes/NLRam"{print $1}' | sed 's/s[0-9]*$//')
-    diskutil unmountDisk force "$dev" >/dev/null 2>&1 || true
-    hdiutil detach "$dev" -force >/dev/null 2>&1 || true
-  fi
+  local d
+  for d in $(mount | awk '$3 ~ /^\/Volumes\/NLRam/{print $1}' | sed 's/s[0-9]*$//' | sort -u); do
+    diskutil unmountDisk force "$d" >/dev/null 2>&1 || true
+    hdiutil detach "$d" -force >/dev/null 2>&1 || true
+  done
   cmd_ramdisk
   cmd_start
 }
