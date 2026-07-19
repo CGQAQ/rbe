@@ -1109,6 +1109,23 @@ cmd_ramdisk() {
   log "RAM disk mounted at $vol (${size_gb}GB, $dev). Contents vanish on reboot/unmount."
 }
 
+# Recycle the RAM-disk scratch: APFS metadata (B-tree) bloat from millions
+# of created/deleted inodes degrades worker throughput over long builds
+# (~40/min fresh -> ~20/min after ~15M inodes). A recycle restores the fresh
+# rate; caches repopulate from the master CAS in ~2-3 min.
+cmd_refresh_scratch() {
+  load_env
+  ./manage.sh stop >/dev/null 2>&1 || true
+  if mount | grep -q " /Volumes/NLRam "; then
+    local dev
+    dev=$(mount | awk '$3=="/Volumes/NLRam"{print $1}' | sed 's/s[0-9]*$//')
+    diskutil unmountDisk force "$dev" >/dev/null 2>&1 || true
+    hdiutil detach "$dev" -force >/dev/null 2>&1 || true
+  fi
+  cmd_ramdisk
+  cmd_start
+}
+
 cmd_siso_setup() {
   local src="" master_override="" instance_override="" port_override=""
   while [ $# -gt 0 ]; do
@@ -1164,6 +1181,7 @@ main() {
     doctor)     cmd_doctor "$@" ;;
     siso-setup) cmd_siso_setup "$@" ;;
     ramdisk) cmd_ramdisk "$@" ;;
+    refresh-scratch) cmd_refresh_scratch "$@" ;;
     siso-env)   cmd_siso_env "$@" ;;
     env)        cmd_env "$@" ;;
     -h|--help|help|"") usage ;;
